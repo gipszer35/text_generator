@@ -1,11 +1,30 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import time
+import datetime
 import os, sys
 import sentencepiece as spm
 from dataclasses import dataclass
+import logging
 
+def create_logger():
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    # always reset in notebooks (Colab/IPython safe)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+
+    logger.addHandler(handler)
+    logger.propagate = False  # prevents duplicate root logs
+
+    return logger
+
+logger = create_logger()
 
 def is_colab():
     return "COLAB_GPU" in os.environ
@@ -15,9 +34,9 @@ def is_colab():
 class Config:
     root_dir: str
     text_generator_dir: str
+    batch_size: int
 
     tokenizer_name: str = "hu_tokenizer"
-    batch_size: int = 32
 
     block_size: int = 512
     n_embed: int = 512
@@ -40,6 +59,10 @@ class Config:
     def tokenizer_prefix(self):
         return os.path.join(self.text_generator_dir, self.tokenizer_name)
 
+    @property
+    def token_cache_file(self):
+        return os.path.join(self.text_generator_dir, "token_cache.pt")
+
 
 def create_config() -> Config:
     if is_colab():
@@ -50,13 +73,14 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         text_generator_dir = root_dir + "TextGenerator/"
+        batch_size = 16
     else:
         root_dir = "./"
         text_generator_dir = root_dir
+        batch_size = 2
 
     return Config(
-        root_dir=root_dir,
-        text_generator_dir=text_generator_dir,
+        root_dir=root_dir, text_generator_dir=text_generator_dir, batch_size=batch_size
     )
 
 
@@ -68,7 +92,7 @@ import my_common as my
 
 class SentencePieceTokenizer:
     def __init__(self, max_len=32):
-        print("Init sentece tokenizer")
+        logger.info("Init sentece tokenizer")
         self.vocab_size = 8000
         self.sp = spm.SentencePieceProcessor()
         self.max_len = max_len
@@ -78,7 +102,7 @@ class SentencePieceTokenizer:
         if not os.path.exists(self.model_path):
             self.train_tokenizer(config.input_txt, f"{config.tokenizer_prefix}")
         else:
-            print(f"Load tokenizer model from {self.model_path}")
+            logger.info(f"Load tokenizer model from {self.model_path}")
 
         self.sp.load(self.model_path)
 
@@ -92,7 +116,7 @@ class SentencePieceTokenizer:
             raise ValueError("[MASK] not found in vocab")
 
     def train_tokenizer(self, input_path, model_prefix):
-        print("Start tokenizer training")
+        logger.info("Start tokenizer training")
         spm.SentencePieceTrainer.train(
             input=input_path,
             model_prefix=model_prefix,
@@ -104,7 +128,7 @@ class SentencePieceTokenizer:
             eos_id=3,
             user_defined_symbols=["[CLS]", "[SEP]", "[MASK]", "[NL]"],
         )
-        print("Tokenizer training finished")
+        logger.info("Tokenizer training finished")
 
     def preprocess_text(self, text):
         text = text.replace("\n", " [NL] ")
@@ -117,7 +141,6 @@ class SentencePieceTokenizer:
 
     def decode(self, tokens):
         text = self.sp.decode(tokens)
-        text = text.replace("[PAR]", "\n\n")
         text = text.replace("[NL]", "\n")
         return text
 
@@ -125,14 +148,22 @@ class SentencePieceTokenizer:
 class BatchLoader:
     def __init__(self):
         self.tokenizer = SentencePieceTokenizer()
-        print("Loading text")
-        with open(config.input_txt, "r", encoding="utf-8") as f:
-            text = f.read()
-        print("Tokenizing text")
-        data = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+        token_cache_file = config.token_cache_file
+        if os.path.exists(token_cache_file):
+            logger.info(f"Loading tokens from {token_cache_file}")
+            data = torch.load(token_cache_file)
+        else:
+            chunk_size = 1024 * 1024
+            logger.info("Tokenizing text")
+            data = []
+            with open(config.input_txt, "r", encoding="utf-8") as f:
+                while chunk := f.read(chunk_size):
+                    data.extend(self.tokenizer.encode(chunk))
+            data = torch.tensor(data, dtype=torch.long)
+            logger.info(f"Save tokens to {token_cache_file}")
+            torch.save(data, token_cache_file)
         # Train and test splits
-        print("text lennght:", len(text))
-        print("data lennght:", len(data))
+        logger.info(f"data lenght: {len(data)}")
         n = int(0.95 * len(data))  # first 95% will be train, rest validation
         self.train_data = data[:n]
         self.validation_data = data[n:]
@@ -158,7 +189,9 @@ class Head(nn.Module):
         self.value = nn.Linear(config.n_embed, head_size, bias=False)
         self.register_buffer(
             "tril",
-            torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool)),
+            torch.tril(
+                torch.ones(config.block_size, config.block_size, dtype=torch.bool)
+            ),
             persistent=False,
         )
 
@@ -240,7 +273,10 @@ class GPTLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, config.n_embed)
         self.position_embedding_table = nn.Embedding(config.block_size, config.n_embed)
         self.blocks = nn.Sequential(
-            *[Block(config.n_embed, n_head=config.n_head) for _ in range(config.n_layer)]
+            *[
+                Block(config.n_embed, n_head=config.n_head)
+                for _ in range(config.n_layer)
+            ]
         )
         self.ln_f = nn.LayerNorm(config.n_embed)  # final layer norm
         self.lm_head = nn.Linear(config.n_embed, vocab_size)
@@ -283,7 +319,7 @@ class GPTLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -BLOCK_SIZE:]
+            idx_cond = idx[:, -config.block_size :]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -315,9 +351,8 @@ class GPTTrainer:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.start_step = checkpoint["step"]
 
-        # print the number of parameters in the model
-        print(sum(p.numel() for p in self.model.parameters()) / 1e6, "M sparameters")
-        # create a PyTorch optimizer
+        # print parameters and layers of the model
+        my.print_parameter_summary(self.model)
 
     def get_lr(self, step):
         # warmup
@@ -327,9 +362,11 @@ class GPTTrainer:
 
     def generate_from_model(self):
         context = torch.zeros((1, 1), dtype=torch.long, device=my.DEVICE)
-        print(
+        logger.info(
             self.batch_loader.tokenizer.decode(
-                self.model.generate(context, max_new_tokens=config.block_size)[0].tolist()
+                self.model.generate(context, max_new_tokens=config.block_size)[
+                    0
+                ].tolist()
             )
         )
 
@@ -359,7 +396,8 @@ class GPTTrainer:
     def train(self):
         max_iters = 120000
 
-        t = 1
+        logger.info("Start training")
+        logger.info(f"Batch size: {config.batch_size}")
         for step in range(self.start_step, max_iters):
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
@@ -372,13 +410,13 @@ class GPTTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            if not step % t:
-                print(step, "unix time: ", int(time.time()))
-            if not step % (t * 10):
+            if not step % (10):
+                logger.info(f"current time: {datetime.datetime.now()}")
+                logger.info(f"current step: {step}")
                 self.generate_from_model()
                 losses = self.estimate_loss()
                 for k, v in losses.items():
-                    print(f"{k + ' loss':<18}: {v:.4f}")
+                    logger.info(f"{k + ' loss':<18}: {v:.4f}")
                 self.save_checkpoint(step)
 
 
