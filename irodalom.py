@@ -46,8 +46,8 @@ class Config:
     n_head: int = 8
     n_layer: int = 12
     dropout: float = 0.2
-
-    max_lr: float = 5e-4  # at start the 5e-4 is good for small models
+    # At start the max_lr=5e-4 is good for small models. But with warmup.
+    max_lr: float = 1e-4
     warmup_steps: int = 2000
 
     @property
@@ -383,6 +383,7 @@ class GPTTrainer:
         self.batch_loader = BatchLoader()
         vocab_size = self.batch_loader.tokenizer.vocab_size
         self.model = GPTLanguageModel(vocab_size).to(my.DEVICE)
+        self.set_dropout_called = False
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, fused=True
@@ -407,12 +408,14 @@ class GPTTrainer:
 
     def generate_from_model(self):
         context = torch.zeros((1, 1), dtype=torch.long, device=my.DEVICE)
-        logger.info(
+        print(
+            "\n",
             self.batch_loader.tokenizer.decode(
                 self.model.generate(context, max_new_tokens=config.block_size)[
                     0
                 ].tolist()
-            )
+            ),
+            "\n",
         )
 
     @torch.no_grad()
@@ -438,12 +441,20 @@ class GPTTrainer:
         }
         torch.save(checkpoint, config.model_file)
 
+    def set_dropout(self):
+        if not self.set_dropout_called:
+            self.set_dropout_called = True
+            for m in self.model.modules():
+                if isinstance(m, torch.nn.Dropout):
+                    m.p = 0.001
+
     def train(self):
         max_iters = 120000
 
         logger.info("Start training")
         logger.info(f"Batch size: {config.batch_size}")
         for step in range(self.start_step, max_iters):
+            self.set_dropout()
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
@@ -455,14 +466,18 @@ class GPTTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
-            if not step % (10):
+            if not step % (50):
                 logger.info(f"Time: {datetime.datetime.now()}")
-                logger.info(f"Current step: {step}, get_lr: {self.get_lr(step)}")
-                self.generate_from_model()
+                logger.info(f"Epoch: {step}")
+                logger.info(f"get_lr: {self.get_lr(step)}")
                 losses = self.estimate_loss()
                 for k, v in losses.items():
                     logger.info(f"{k + ' loss':<18}: {v:.4f}")
+                self.generate_from_model()
+                logger.info(f"Save checkpoint: {config.model_file}")
                 self.save_checkpoint(step)
+                logger.info(f"Checkpoint saved")
+
 
 
 def train():
