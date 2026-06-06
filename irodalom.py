@@ -7,6 +7,7 @@ import sentencepiece as spm
 from dataclasses import dataclass
 import logging
 
+
 def create_logger():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
@@ -24,7 +25,9 @@ def create_logger():
 
     return logger
 
+
 logger = create_logger()
+
 
 def is_colab():
     return "COLAB_GPU" in os.environ
@@ -44,7 +47,7 @@ class Config:
     n_layer: int = 12
     dropout: float = 0.2
 
-    max_lr: float = 1e-4
+    max_lr: float = 5e-4  # at start the 5e-4 is good for small models
     warmup_steps: int = 2000
 
     @property
@@ -53,7 +56,7 @@ class Config:
 
     @property
     def model_file(self):
-        return os.path.join(self.text_generator_dir, "regeny_gpt.pt")
+        return os.path.join(self.text_generator_dir, "irodalom_gpt.pt")
 
     @property
     def tokenizer_prefix(self):
@@ -73,7 +76,7 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         text_generator_dir = root_dir + "TextGenerator/"
-        batch_size = 16
+        batch_size = 48
     else:
         root_dir = "./"
         text_generator_dir = root_dir
@@ -231,6 +234,49 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
+class EfficientAttention(nn.Module):
+    def __init__(self, n_embd=512, n_head=8):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head  # 512 // 8 = 64 channels per head
+
+        # Combined projections for all 8 heads into single, highly optimized matrix operations
+        self.q_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.key_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.val_proj = nn.Linear(n_embd, n_embd, bias=False)
+
+        # Final output projection layer
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        # B: Batch size (16), T: Sequence length / Block size (512), C: Embedding dimension (512)
+        B, T, C = x.shape
+
+        # 1. Project inputs and reshape to isolate the attention heads
+        # Tensor transformation flow: [B, T, C] -> [B, T, n_head, head_dim] -> [B, n_head, T, head_dim]
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.key_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.val_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # 2. Execute PyTorch's native Scaled Dot-Product Attention (SDPA)
+        # This triggers FlashAttention kernels under the hood.
+        # It is mathematically identical to your old loop but prevents the massive VRAM overhead.
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=config.dropout if self.training else 0.0
+        )
+
+        # 3. Concatenate all attention heads back into a single feature tensor
+        # Tensor transformation flow: [B, n_head, T, head_dim] -> [B, T, n_head, head_dim] -> [B, T, C]
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+
+        # 4. Apply final linear projection mapping
+        out = self.proj(out)
+        # 5. And a final dropout
+        out = self.dropout(out)
+        return out
+
+
 class FeedFoward(nn.Module):
     """a simple linear layer followed by a non-linearity"""
 
@@ -253,8 +299,7 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        self.sa = EfficientAttention(n_embd, n_head)
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -340,7 +385,7 @@ class GPTTrainer:
         self.model = GPTLanguageModel(vocab_size).to(my.DEVICE)
 
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), betas=(0.9, 0.95), weight_decay=0.1
+            self.model.parameters(), betas=(0.9, 0.95), weight_decay=0.1, fused=True
         )
 
         self.start_step = 0
@@ -411,8 +456,8 @@ class GPTTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             if not step % (10):
-                logger.info(f"current time: {datetime.datetime.now()}")
-                logger.info(f"current step: {step}")
+                logger.info(f"Time: {datetime.datetime.now()}")
+                logger.info(f"Current step: {step}, get_lr: {self.get_lr(step)}")
                 self.generate_from_model()
                 losses = self.estimate_loss()
                 for k, v in losses.items():
