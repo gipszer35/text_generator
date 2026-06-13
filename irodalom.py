@@ -6,31 +6,17 @@ import os, sys
 import sentencepiece as spm
 from dataclasses import dataclass
 import logging
-
-
-def create_logger():
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-
-    # always reset in notebooks (Colab/IPython safe)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(levelname)s | %(message)s")
-    handler.setFormatter(formatter)
-
-    logger.addHandler(handler)
-    logger.propagate = False  # prevents duplicate root logs
-
-    return logger
-
-
-logger = create_logger()
+from enum import Enum
+import random
 
 
 def is_colab():
     return "COLAB_GPU" in os.environ
+
+
+class DataSource(Enum):
+    WIKI = "wiki"
+    NOVEL = "novel"
 
 
 @dataclass
@@ -39,32 +25,42 @@ class Config:
     text_generator_dir: str
     batch_size: int
 
-    tokenizer_name: str = "hu_tokenizer"
-
     block_size: int = 512
     n_embed: int = 512
     n_head: int = 8
-    n_layer: int = 12
-    dropout: float = 0.2
+    n_layer: int = 14
+    dropout: float = 0.0
     # At start the max_lr=5e-4 is good for small models. But with warmup.
     max_lr: float = 1e-4
     warmup_steps: int = 2000
 
     @property
-    def input_txt(self):
-        return os.path.join(self.text_generator_dir, "RegenyKorpusz.txt")
+    def out_dir(self):
+        return os.path.join(self.text_generator_dir, "irodalom_out")
+
+    @property
+    def novels_txt(self):
+        return os.path.join(self.text_generator_dir, "regenykorpusz.txt")
+
+    @property
+    def wiki_txt(self):
+        return os.path.join(self.text_generator_dir, "wiki_hu.txt")
 
     @property
     def model_file(self):
-        return os.path.join(self.text_generator_dir, "irodalom_gpt.pt")
+        return os.path.join(self.out_dir, "irodalom_gpt_2.pt")
 
     @property
     def tokenizer_prefix(self):
-        return os.path.join(self.text_generator_dir, self.tokenizer_name)
+        return os.path.join(self.out_dir, "hu_tokenizer")
 
     @property
-    def token_cache_file(self):
-        return os.path.join(self.text_generator_dir, "token_cache.pt")
+    def novel_token_cache(self):
+        return os.path.join(self.out_dir, "novel_token_cache.pt")
+
+    @property
+    def wiki_token_cache(self):
+        return os.path.join(self.out_dir, "wiki_token_cache.pt")
 
 
 def create_config() -> Config:
@@ -76,7 +72,7 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         text_generator_dir = root_dir + "TextGenerator/"
-        batch_size = 48
+        batch_size = 40
     else:
         root_dir = "./"
         text_generator_dir = root_dir
@@ -92,36 +88,69 @@ config = create_config()
 sys.path.append(config.root_dir)
 import my_common as my
 
+logger = my.create_logger()
+
 
 class SentencePieceTokenizer:
-    def __init__(self, max_len=32):
-        logger.info("Init sentece tokenizer")
+    def __init__(self, max_len=256):
+        logger.info("Initializing SentencePiece tokenizer")
+        self.special_tokens = ["[MASK]", "[NL]", "[WIKI]", "[NOVEL]"]
+
         self.vocab_size = 8000
         self.sp = spm.SentencePieceProcessor()
         self.max_len = max_len
 
-        self.model_path = f"{config.tokenizer_prefix}.model"
+        self.tokenizer_model_path = f"{config.tokenizer_prefix}.model"
 
-        if not os.path.exists(self.model_path):
-            self.train_tokenizer(config.input_txt, f"{config.tokenizer_prefix}")
+        if not os.path.exists(self.tokenizer_model_path):
+            self.train_tokenizer(f"{config.tokenizer_prefix}")
         else:
-            logger.info(f"Load tokenizer model from {self.model_path}")
+            logger.info(f"Loading tokenizer model from {self.tokenizer_model_path}")
 
-        self.sp.load(self.model_path)
+        self.sp.load(self.tokenizer_model_path)
 
-        # Standard BERT-style special token IDs
         self.pad_id = self.sp.pad_id()
         self.unk_id = self.sp.unk_id()
-        self.cls_id = self.sp.bos_id()
-        self.sep_id = self.sp.eos_id()
-        self.mask_id = self.sp.piece_to_id("[MASK]")
-        if self.mask_id == self.unk_id:
-            raise ValueError("[MASK] not found in vocab")
+        self.bos_id = self.sp.bos_id()
+        self.eos_id = self.sp.eos_id()
 
-    def train_tokenizer(self, input_path, model_prefix):
-        logger.info("Start tokenizer training")
+        self.special_ids = {}
+
+        for token in self.special_tokens:
+            token_id = self.sp.piece_to_id(token)
+            if token_id == self.unk_id:
+                raise ValueError(
+                    f"Critical Error: Special token {token} not found in vocab!"
+                )
+            self.special_ids[token] = token_id
+
+        self.mask_id = self.special_ids["[MASK]"]
+        self.nl_id = self.special_ids["[NL]"]
+        self.wiki_id = self.special_ids["[WIKI]"]
+        self.novel_id = self.special_ids["[NOVEL]"]
+
+        logger.info(
+            f"Tokenizer loaded successfully! Active Vocab Size: {self.sp.get_piece_size()}"
+        )
+        logger.info(self)
+
+    def __str__(self):
+        return (
+            "Tokenizer IDs:\n"
+            f"  pad_id   = {self.pad_id}\n"
+            f"  unk_id   = {self.unk_id}\n"
+            f"  bos_id   = {self.bos_id}\n"
+            f"  eos_id   = {self.eos_id}\n"
+            f"  mask_id  = {self.mask_id}\n"
+            f"  nl_id    = {self.nl_id}\n"
+            f"  wiki_id  = {self.wiki_id}\n"
+            f"  novel_id = {self.novel_id}"
+        )
+
+    def train_tokenizer(self, model_prefix):
+        logger.info("Starting tokenizer training pipeline")
         spm.SentencePieceTrainer.train(
-            input=input_path,
+            input=f"{config.novels_txt},{config.wiki_txt}",
             model_prefix=model_prefix,
             vocab_size=self.vocab_size,
             model_type="bpe",
@@ -129,29 +158,32 @@ class SentencePieceTokenizer:
             unk_id=1,
             bos_id=2,
             eos_id=3,
-            user_defined_symbols=["[CLS]", "[SEP]", "[MASK]", "[NL]"],
+            user_defined_symbols=self.special_tokens,
         )
-        logger.info("Tokenizer training finished")
+        logger.info("Tokenizer training process finished successfully")
 
-    def preprocess_text(self, text):
+    def encode(self, text: str):
         text = text.replace("\n", " [NL] ")
-        return text
+        tokens = self.sp.encode_as_ids(text)
 
-    def encode(self, text):
-        text = self.preprocess_text(text)
-        tokens = self.sp.encode(text, out_type=int)
         return tokens
 
     def decode(self, tokens):
-        text = self.sp.decode(tokens)
-        text = text.replace("[NL]", "\n")
-        return text
+        tokens = list(tokens)
+
+        if tokens and tokens[0] in (self.wiki_id, self.novel_id, self.bos_id):
+            tokens = tokens[1:]
+
+        if tokens and tokens[-1] == self.eos_id:
+            tokens = tokens[:-1]
+
+        text = self.sp.decode_ids(tokens)
+        return text.replace("[NL]", "\n")
 
 
 class BatchLoader:
-    def __init__(self):
-        self.tokenizer = SentencePieceTokenizer()
-        token_cache_file = config.token_cache_file
+    def __init__(self, tokenizer, token_cache_file, text_file):
+        self.tokenizer = tokenizer
         if os.path.exists(token_cache_file):
             logger.info(f"Loading tokens from {token_cache_file}")
             data = torch.load(token_cache_file)
@@ -159,7 +191,7 @@ class BatchLoader:
             chunk_size = 1024 * 1024
             logger.info("Tokenizing text")
             data = []
-            with open(config.input_txt, "r", encoding="utf-8") as f:
+            with open(text_file, "r", encoding="utf-8") as f:
                 while chunk := f.read(chunk_size):
                     data.extend(self.tokenizer.encode(chunk))
             data = torch.tensor(data, dtype=torch.long)
@@ -182,56 +214,36 @@ class BatchLoader:
         return x, y
 
 
-class Head(nn.Module):
-    """one head of self-attention"""
-
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(config.n_embed, head_size, bias=False)
-        self.query = nn.Linear(config.n_embed, head_size, bias=False)
-        self.value = nn.Linear(config.n_embed, head_size, bias=False)
-        self.register_buffer(
-            "tril",
-            torch.tril(
-                torch.ones(config.block_size, config.block_size, dtype=torch.bool)
-            ),
-            persistent=False,
+class MultiBatchLoader:
+    def __init__(self):
+        logger.info(
+            "Initializing MultiBatchLoader with synchronized X and Y conditioning"
+        )
+        self.tokenizer = SentencePieceTokenizer()
+        self.novel_batch_loader = BatchLoader(
+            self.tokenizer, config.novel_token_cache, config.novels_txt
+        )
+        self.wiki_batch_loader = BatchLoader(
+            self.tokenizer, config.wiki_token_cache, config.wiki_txt
         )
 
-        self.dropout = nn.Dropout(config.dropout)
+    def get_batch(self, split, source: DataSource):
+        if source == DataSource.WIKI:
+            x, y = self.wiki_batch_loader.get_batch(split)
+            style_token = self.tokenizer.wiki_id
+        elif source == DataSource.NOVEL:
+            x, y = self.novel_batch_loader.get_batch(split)
+            style_token = self.tokenizer.novel_id
+        else:
+            raise ValueError(f"Invalid DataSource: {source}")
 
-    def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B, T, C = x.shape
-        k = self.key(x)  # (B, T, hs)
-        q = self.query(x)  # (B, T, hs)
-        # compute attention scores ("affinities")
-        wei = (
-            q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
-        )  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x)  # (B, T, hs)
-        out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
+        # Clone both tensors to prevent PyTorch in-place autograd errors
+        x = x.clone()
+        y = y.clone()
 
+        x[:, 0] = style_token
 
-class MultiHeadAttention(nn.Module):
-    """multiple heads of self-attention in parallel"""
-
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, config.n_embed)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
+        return x, y
 
 
 class EfficientAttention(nn.Module):
@@ -380,8 +392,8 @@ class GPTLanguageModel(nn.Module):
 
 class GPTTrainer:
     def __init__(self):
-        self.batch_loader = BatchLoader()
-        vocab_size = self.batch_loader.tokenizer.vocab_size
+        self.multi_batch_loader = MultiBatchLoader()
+        vocab_size = self.multi_batch_loader.tokenizer.vocab_size
         self.model = GPTLanguageModel(vocab_size).to(my.DEVICE)
         self.set_dropout_called = False
 
@@ -407,16 +419,32 @@ class GPTTrainer:
         return config.max_lr
 
     def generate_from_model(self):
-        context = torch.zeros((1, 1), dtype=torch.long, device=my.DEVICE)
-        print(
-            "\n",
-            self.batch_loader.tokenizer.decode(
-                self.model.generate(context, max_new_tokens=config.block_size)[
-                    0
-                ].tolist()
-            ),
-            "\n",
-        )
+        self.model.eval()
+
+        source = self.get_random_source()
+
+        if source == DataSource.WIKI:
+            start_token_id = self.multi_batch_loader.tokenizer.wiki_id
+            style_label = "[WIKI MODE]"
+        else:
+            start_token_id = self.multi_batch_loader.tokenizer.novel_id
+            style_label = "[NOVEL MODE]"
+
+        print(f"\nGenerating in {style_label}")
+        context = torch.tensor([[start_token_id]], dtype=torch.long, device=my.DEVICE)
+
+        generated_tokens = self.model.generate(
+            context, max_new_tokens=config.block_size
+        )[0].tolist()
+        decoded_text = self.multi_batch_loader.tokenizer.decode(generated_tokens)
+
+        print("\n", decoded_text, "\n")
+        self.model.train()
+
+    def get_random_source(self, novel_ratio: float = 0.5) -> DataSource:
+        if random.random() < novel_ratio:
+            return DataSource.NOVEL
+        return DataSource.WIKI
 
     @torch.no_grad()
     def estimate_loss(self):
@@ -426,7 +454,9 @@ class GPTTrainer:
         for split in ["train", "validation"]:
             losses = torch.zeros(eval_iters)
             for k in range(eval_iters):
-                X, Y = self.batch_loader.get_batch(split)
+                X, Y = self.multi_batch_loader.get_batch(
+                    split, self.get_random_source(0.5)
+                )
                 logits, loss = self.model(X, Y)
                 losses[k] = loss.item()
             out[split] = losses.mean().item()
@@ -439,37 +469,56 @@ class GPTTrainer:
             "optimizer": self.optimizer.state_dict(),
             "step": step,
         }
-        torch.save(checkpoint, config.model_file)
+        temp_model_file = f"{config.model_file}.new"
+        torch.save(checkpoint, temp_model_file)
+        os.replace(temp_model_file, config.model_file)
 
     def set_dropout(self):
         if not self.set_dropout_called:
             self.set_dropout_called = True
             for m in self.model.modules():
                 if isinstance(m, torch.nn.Dropout):
-                    m.p = 0.001
+                    m.p = config.dropout
 
     def train(self):
         max_iters = 120000
 
         logger.info("Start training")
         logger.info(f"Batch size: {config.batch_size}")
+
+        accum_steps = 10
+
+        self.optimizer.zero_grad(set_to_none=True)
         for step in range(self.start_step, max_iters):
             self.set_dropout()
+
             lr = self.get_lr(step)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
-            # sample a batch of data
-            xb, yb = self.batch_loader.get_batch("train")
-            # evaluate the loss
+
+            xb, yb = self.multi_batch_loader.get_batch(
+                "train", self.get_random_source()
+            )
+
             logits, loss = self.model(xb, yb)
-            self.optimizer.zero_grad(set_to_none=True)
+
+            # Scale loss so gradients match a larger batch
+            loss = loss / accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+
+            if (step + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
             if not step % (50):
-                logger.info(f"Time: {datetime.datetime.now()}")
-                logger.info(f"Epoch: {step}")
-                logger.info(f"get_lr: {self.get_lr(step)}")
+                logger.info(f"Time:           {datetime.datetime.now()}")
+                logger.info(f"Epoch:          {step}")
+                logger.info(f"Max lr:         {config.max_lr}")
+                logger.info(f"get_lr:         {self.get_lr(step)}")
+                logger.info(f"Batch size:     {config.batch_size}")
+                logger.info(f"Backward bsize: {config.batch_size * accum_steps}")
+                logger.info(f"Dropout:        {config.dropout}")
                 losses = self.estimate_loss()
                 for k, v in losses.items():
                     logger.info(f"{k + ' loss':<18}: {v:.4f}")
@@ -479,8 +528,16 @@ class GPTTrainer:
                 logger.info(f"Checkpoint saved")
 
 
+def ensure_dir(path):
+    if os.path.exists(path):
+        logger.info(f"Directory already exists: {path}")
+    else:
+        os.makedirs(path)
+        logger.info(f"Created directory: {path}")
+
 
 def train():
+    ensure_dir(config.out_dir)
     trainer = GPTTrainer()
     trainer.train()
 

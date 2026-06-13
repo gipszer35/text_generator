@@ -9,7 +9,7 @@ ds = load_dataset(
     streaming=True
 )
 
-output_dir = "wikipedia_hu_wiki"
+output_dir = "wiki_hu"
 os.makedirs(output_dir, exist_ok=True)
 
 BAD_TITLES = {
